@@ -8,14 +8,23 @@ export const JSON_TYPE = 'application/json; charset=utf-8';
 
 /** Answer with a JSON body. Every reply carries a non-empty X-GitHub-Request-Id. */
 export function sendJson(store: Store, res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
-  const text = `${JSON.stringify(body)}\n`;
+  sendJsonBuffer(store, res, status, Buffer.from(`${JSON.stringify(body)}\n`, 'utf8'), headers);
+}
+
+/**
+ * Answer with a JSON body that is already serialized, byte for byte what sendJson would
+ * have produced for the same value. Hot read paths memoize these buffers and hand them
+ * back here, so a repeat answer skips the object building and the stringify entirely;
+ * the request id is still minted fresh for every reply.
+ */
+export function sendJsonBuffer(store: Store, res: ServerResponse, status: number, body: Buffer, headers: Record<string, string> = {}): void {
   res.writeHead(status, {
     'content-type': JSON_TYPE,
-    'content-length': Buffer.byteLength(text),
+    'content-length': body.length,
     'x-github-request-id': store.requestId(),
     ...headers,
   });
-  res.end(text);
+  res.end(body);
 }
 
 /** Answer with no body at all (a 204). */

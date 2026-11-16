@@ -30,22 +30,26 @@ import {
   treeEntryAt,
   type FlatTree,
 } from './git.ts';
-import { isRecord, readJson, sendEmpty, sendError, sendJson, stringField } from './http.ts';
+import { isRecord, readJson, sendEmpty, sendError, sendJson, sendJsonBuffer, stringField } from './http.ts';
 
 // ------------------------------------------------------------------ serializers
 
+/** The viewer's JSON shape, built once: it names constants of the trial, so every
+ *  answer embeds the same record; callers only ever read or spread it. */
+const USER_JSON: Record<string, unknown> = {
+  login: VIEWER.login,
+  id: VIEWER.id,
+  node_id: Buffer.from(`User:${VIEWER.id}`).toString('base64'),
+  avatar_url: '',
+  html_url: `/${VIEWER.login}`,
+  type: VIEWER.type,
+  site_admin: false,
+  name: VIEWER.name,
+  email: VIEWER.email,
+};
+
 export function userJson(): Record<string, unknown> {
-  return {
-    login: VIEWER.login,
-    id: VIEWER.id,
-    node_id: Buffer.from(`User:${VIEWER.id}`).toString('base64'),
-    avatar_url: '',
-    html_url: `/${VIEWER.login}`,
-    type: VIEWER.type,
-    site_admin: false,
-    name: VIEWER.name,
-    email: VIEWER.email,
-  };
+  return USER_JSON;
 }
 
 export function repoJson(repo: Repo): Record<string, unknown> {
@@ -109,6 +113,40 @@ export function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {
     url: `/api/v3/repos/${VIEWER.login}/${repo.name}/issues/${issue.number}`,
     repository_url: `/api/v3/repos/${VIEWER.login}/${repo.name}`,
   };
+}
+
+/**
+ * Serialized single-issue answers, memoized per issue record. Reading one issue is
+ * the forge's hottest REST read, and the answer is a pure function of the issue and
+ * the repo's label table, so a repeat read can serve the very bytes the first one
+ * produced. The stamp names everything that can move: every field edit stamps a
+ * fresh updatedAt from the store's ticking clock (no two mutations share one), the
+ * comment count rides along because a comment does not restamp its issue, and each
+ * label is read live, so a rename, recolor or delete in the label table shows up in
+ * the stamp even though the issue record itself was never touched.
+ */
+const issueBodies = new WeakMap<Issue, { stamp: string; body: Buffer }>();
+
+function issueStamp(repo: Repo, issue: Issue): string {
+  let stamp = `${issue.updatedAt}|${issue.state}|${issue.comments.length}`;
+  for (const name of issue.labels) {
+    const label = repo.labels.get(name);
+    stamp += label === undefined ? `|!${name}` : `|${label.id}:${label.name}:${label.color}:${label.description}`;
+  }
+  return stamp;
+}
+
+/** Answer a single-issue read (or the echo of its edit) with the memoized bytes. */
+function sendIssue(store: Store, res: ServerResponse, repo: Repo, issue: Issue): void {
+  const stamp = issueStamp(repo, issue);
+  const held = issueBodies.get(issue);
+  if (held !== undefined && held.stamp === stamp) {
+    sendJsonBuffer(store, res, 200, held.body);
+    return;
+  }
+  const body = Buffer.from(`${JSON.stringify(issueJson(repo, issue))}\n`, 'utf8');
+  issueBodies.set(issue, { stamp, body });
+  sendJsonBuffer(store, res, 200, body);
 }
 
 function refSha(repo: Repo, branch: string): string {
@@ -748,7 +786,7 @@ async function handleIssues(
     }
     return sendError(store, res, 404, 'Not Found');
   }
-  if (method === 'GET') return sendJson(store, res, 200, issueJson(repo, issue));
+  if (method === 'GET') return sendIssue(store, res, repo, issue);
   if (method === 'PATCH') {
     const parsed = await readJson(req);
     if (!parsed.ok || !isRecord(parsed.value)) return sendError(store, res, 400, 'Invalid JSON');
@@ -764,7 +802,7 @@ async function handleIssues(
       issue.labels = labels.names;
     }
     issue.updatedAt = store.tickIso();
-    return sendJson(store, res, 200, issueJson(repo, issue));
+    return sendIssue(store, res, repo, issue);
   }
   return sendError(store, res, 404, 'Not Found');
 }
