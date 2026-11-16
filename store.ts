@@ -94,6 +94,33 @@ function trialNowBaseSec(): number {
   return 1735689600;
 }
 
+/**
+ * Format epoch seconds as an ISO 8601 UTC string with whole-second precision,
+ * arithmetically. tickIso sits on every mutation's path, and building a Date just
+ * to stringify it costs several times what the calendar math does; the result is
+ * byte-identical to a Date's toISOString with the fractional part dropped.
+ */
+function isoFromEpochSec(sec: number): string {
+  const days = Math.floor(sec / 86400);
+  const secs = sec - days * 86400;
+  const hour = Math.floor(secs / 3600);
+  const minute = Math.floor((secs - hour * 3600) / 60);
+  const second = secs - hour * 3600 - minute * 60;
+  // Civil date from a day count (Howard Hinnant's algorithm).
+  const z = days + 719468;
+  const era = Math.floor(z / 146097);
+  const doe = z - era * 146097;
+  const yoe = Math.floor((doe - Math.floor(doe / 1460) + Math.floor(doe / 36524) - Math.floor(doe / 146096)) / 365);
+  const yearBase = yoe + era * 400;
+  const doy = doe - (365 * yoe + Math.floor(yoe / 4) - Math.floor(yoe / 100));
+  const mp = Math.floor((5 * doy + 2) / 153);
+  const day = doy - Math.floor((153 * mp + 2) / 5) + 1;
+  const month = mp + (mp < 10 ? 3 : -9);
+  const year = month <= 2 ? yearBase + 1 : yearBase;
+  const pad = (value: number, width: number): string => String(value).padStart(width, '0');
+  return `${pad(year, 4)}-${pad(month, 2)}-${pad(day, 2)}T${pad(hour, 2)}:${pad(minute, 2)}:${pad(second, 2)}Z`;
+}
+
 export class Store {
   /** Every git object the forge holds, across repositories, by SHA-1 hex. */
   readonly objects = new Map<string, GitObject>();
@@ -119,7 +146,7 @@ export class Store {
 
   /** The current logical time as an ISO string, advancing the clock. */
   tickIso(): string {
-    return new Date(this.tickSec() * 1000).toISOString().replace('.000Z', 'Z');
+    return isoFromEpochSec(this.tickSec());
   }
 
   /** A deterministic, non-empty request id for the X-GitHub-Request-Id header. */
