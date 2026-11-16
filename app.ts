@@ -5,7 +5,7 @@
 // unknown route is a 404 with one. When the token env var is unset (a local run) the forge
 // serves without auth so it can be exercised by hand.
 
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { createForgeServer, type ForgeRequest, type ForgeResponse, type ForgeServer } from './transport.ts';
 import { Store } from './store.ts';
 import { infoRefs, receivePack, uploadPack, type HandlerResult } from './git.ts';
 import { handleRest } from './rest.ts';
@@ -13,30 +13,53 @@ import { handleGraphQL } from './graphql.ts';
 import { handleMcp } from './mcp.ts';
 import { readBody, sendError, sendJson } from './http.ts';
 
-function sendResult(res: ServerResponse, result: HandlerResult): void {
+function sendResult(res: ForgeResponse, result: HandlerResult): void {
   res.writeHead(result.status, { 'content-type': result.contentType, 'content-length': result.body.length });
   res.end(result.body);
 }
 
-function authorized(req: IncomingMessage, token: string): boolean {
-  if (token === '') return true;
-  return req.headers.authorization === `Bearer ${token}`;
+function authorized(req: ForgeRequest, expectedAuth: string | null): boolean {
+  if (expectedAuth === null) return true;
+  return req.headers.authorization === expectedAuth;
 }
 
-async function route(store: Store, token: string, req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const method = req.method ?? 'GET';
-  let url: URL;
+/**
+ * Split a request target into path and query without building a URL object: the router
+ * only ever needs the raw path (it decodes segment by segment itself) and the query as
+ * search params. An absolute-form target, which this suite never sends, still goes
+ * through the URL parser so its answer stays the one the old code gave.
+ */
+function splitTarget(raw: string): { pathname: string; searchParams: URLSearchParams } | null {
+  if (raw.startsWith('/')) {
+    const queryAt = raw.indexOf('?');
+    return {
+      pathname: queryAt === -1 ? raw : raw.slice(0, queryAt),
+      searchParams: new URLSearchParams(queryAt === -1 ? '' : raw.slice(queryAt + 1)),
+    };
+  }
   try {
-    url = new URL(req.url ?? '/', 'http://entry');
+    const url = new URL(raw, 'http://entry');
+    return { pathname: url.pathname, searchParams: url.searchParams };
   } catch {
+    return null;
+  }
+}
+
+async function route(store: Store, expectedAuth: string | null, req: ForgeRequest, res: ForgeResponse): Promise<void> {
+  const method = req.method ?? 'GET';
+  const target = splitTarget(req.url ?? '/');
+  if (target === null) {
     sendError(store, res, 400, 'Bad Request');
     return;
   }
-  const pathname = url.pathname;
+  const pathname = target.pathname;
   const segments = pathname
     .split('/')
     .filter((segment) => segment !== '')
     .map((segment) => {
+      // Almost every segment is plain text with nothing to decode; the decoder
+      // only earns its call when an escape is actually present.
+      if (!segment.includes('%')) return segment;
       try {
         return decodeURIComponent(segment);
       } catch {
@@ -50,13 +73,13 @@ async function route(store: Store, token: string, req: IncomingMessage, res: Ser
     return;
   }
 
-  if (!authorized(req, token)) {
+  if (!authorized(req, expectedAuth)) {
     sendError(store, res, 401, 'Bad credentials');
     return;
   }
 
   if (segments[0] === 'api' && segments[1] === 'v3') {
-    await handleRest(store, req, res, pathname, segments.slice(2), url.searchParams);
+    await handleRest(store, req, res, pathname, segments.slice(2), target.searchParams);
     return;
   }
 
@@ -85,7 +108,7 @@ async function route(store: Store, token: string, req: IncomingMessage, res: Ser
     }
     const tail = segments.slice(2).join('/');
     if (method === 'GET' && tail === 'info/refs') {
-      const service = url.searchParams.get('service');
+      const service = target.searchParams.get('service');
       if (service !== 'git-upload-pack' && service !== 'git-receive-pack') {
         sendError(store, res, 400, 'service is required');
         return;
@@ -113,11 +136,14 @@ async function route(store: Store, token: string, req: IncomingMessage, res: Ser
 }
 
 /** Build the server. It binds nothing until the caller listens. */
-export function createApp(): Server {
+export function createApp(): ForgeServer {
   const store = new Store();
   const token = process.env.MAKEFUN_SHOP_TOKEN ?? '';
-  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
-    route(store, token, req, res).catch(() => {
+  // The one header value every authenticated request must present, built once here
+  // instead of a template string per request; null means the local no-auth mode.
+  const expectedAuth = token === '' ? null : `Bearer ${token}`;
+  const server = createForgeServer((req, res) => {
+    route(store, expectedAuth, req, res).catch(() => {
       try {
         if (!res.headersSent) sendError(store, res, 500, 'Internal Server Error');
         else res.end();

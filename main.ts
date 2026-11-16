@@ -79,6 +79,10 @@ async function run(): Promise<void> {
   // moments would be scored as a failure the forge never made.
   for (const signal of ['SIGTERM', 'SIGINT'] as const) {
     process.once(signal, () => {
+      // Drop idle keep-alive sockets first: close() waits for connections, and a
+      // suite socket held open in silence would otherwise stall the shutdown
+      // until the fallback timer below cuts the process down mid-drain.
+      server.closeIdleConnections();
       server.close(() => process.exit(0));
       setTimeout(() => process.exit(0), 1_000).unref();
     });
