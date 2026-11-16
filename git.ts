@@ -15,10 +15,15 @@ export function sha1Hex(data: Buffer): string {
   return createHash('sha1').update(data).digest('hex');
 }
 
+/** SHA-1 of two buffers in sequence, without copying either into a joined buffer. */
+export function sha1HexOf(head: Buffer, tail: Buffer): string {
+  return createHash('sha1').update(head).update(tail).digest('hex');
+}
+
 /** Hash an object into the store (or just compute its id when `write` is false). */
 export function hashObject(store: Store, type: GitObjectType, data: Buffer, write = true): string {
   const header = Buffer.from(`${type} ${data.length}\0`, 'utf8');
-  const sha = sha1Hex(Buffer.concat([header, data]));
+  const sha = sha1HexOf(header, data);
   if (write && !store.objects.has(sha)) store.objects.set(sha, { type, data });
   return sha;
 }
@@ -619,7 +624,7 @@ export function parsePack(pack: Buffer, external?: (sha: string) => GitObject | 
   for (const entry of raw) {
     const object = resolve(entry);
     const header = Buffer.from(`${object.type} ${object.data.length}\0`, 'utf8');
-    const sha = sha1Hex(Buffer.concat([header, object.data]));
+    const sha = sha1HexOf(header, object.data);
     objects.set(sha, object);
     resolvedByOid.set(sha, object);
   }
@@ -646,6 +651,9 @@ function headTarget(repo: Repo): string {
 export function infoRefs(store: Store, repo: Repo, service: 'git-upload-pack' | 'git-receive-pack', protocol2: boolean): HandlerResult {
   const contentType = `application/x-${service}-advertisement`;
   if (service === 'git-upload-pack' && protocol2) {
+    // The v2 advertisement names no refs: the same bytes serve every repository.
+    const held = refAnswers.get('info-v2-upload');
+    if (held !== undefined) return held;
     const lines = [
       pktLine('version 2\n'),
       pktLine(`agent=${AGENT}\n`),
@@ -654,8 +662,11 @@ export function infoRefs(store: Store, repo: Repo, service: 'git-upload-pack' | 
       pktLine('object-format=sha1\n'),
       PKT_FLUSH,
     ];
-    return { status: 200, contentType, body: Buffer.concat(lines) };
+    return rememberAnswer(refAnswers, 'info-v2-upload', { status: 200, contentType, body: Buffer.concat(lines) });
   }
+  const cacheKey = `info\n${refsFingerprint(repo)}\n${service}\n${protocol2 ? 'v2' : 'v0'}`;
+  const cached = refAnswers.get(cacheKey);
+  if (cached !== undefined) return cached;
   const caps =
     service === 'git-upload-pack'
       ? `side-band-64k ofs-delta shallow agent=${AGENT} symref=HEAD:${headTarget(repo)}`
@@ -676,7 +687,7 @@ export function infoRefs(store: Store, repo: Repo, service: 'git-upload-pack' | 
     }
   }
   parts.push(PKT_FLUSH);
-  return { status: 200, contentType, body: Buffer.concat(parts) };
+  return rememberAnswer(refAnswers, cacheKey, { status: 200, contentType, body: Buffer.concat(parts) });
 }
 
 // ------------------------------------------------------------------ fetch planning
@@ -831,6 +842,56 @@ function planFetch(store: Store, request: FetchRequest): FetchPlan {
   return { objects: [...objects], shallow, unshallow, acks, nak: acks.length === 0 };
 }
 
+// ------------------------------------------------------------------ answer cache
+
+/**
+ * Repeated protocol answers, memoized. Git objects are immutable and addressed by
+ * their content, so the correct answer to a fixed fetch request cannot change while
+ * the process lives: objects that arrive later only add ancestry nobody named, and
+ * a commit's parents are fixed by its own hash. A fetch answer is therefore cached
+ * once every object the request names is already held (an answer about a missing
+ * want could be overtaken by that want's arrival, so those are never stored).
+ * Advertisements and ls-refs answers do depend on the ref table, so their keys
+ * carry a fingerprint of it, recomputed per request from the handful of refs a
+ * repository holds. Both caches are capped; a full cache clears rather than grows.
+ */
+const ANSWER_CACHE_CAP = 512;
+const fetchAnswers = new Map<string, HandlerResult>();
+const refAnswers = new Map<string, HandlerResult>();
+
+function rememberAnswer(map: Map<string, HandlerResult>, key: string, result: HandlerResult): HandlerResult {
+  if (map.size >= ANSWER_CACHE_CAP) map.clear();
+  map.set(key, result);
+  return result;
+}
+
+/** A string naming the repo's ref state exactly: HEAD's target plus every ref. */
+function refsFingerprint(repo: Repo): string {
+  let print = headTarget(repo);
+  for (const [name, oid] of sortedRefs(repo)) print += `\n${oid} ${name}`;
+  return print;
+}
+
+/** Everything a fetch answer depends on, as one key. */
+function fetchKey(request: FetchRequest, protocol2: boolean): string {
+  return [
+    protocol2 ? 'v2' : 'v0',
+    request.done ? 'done' : 'open',
+    `deepen=${request.deepen ?? ''}`,
+    `want=${request.wants.join(',')}`,
+    `have=${request.haves.join(',')}`,
+    `shallow=${request.shallow.join(',')}`,
+  ].join('|');
+}
+
+/** True when every object the request names is already held, so its answer is final. */
+function requestSettled(store: Store, request: FetchRequest): boolean {
+  for (const sha of request.wants) if (getObject(store, sha) === null) return false;
+  for (const sha of request.haves) if (getObject(store, sha) === null) return false;
+  for (const sha of request.shallow) if (getObject(store, sha) === null) return false;
+  return true;
+}
+
 function sidebandPack(pack: Buffer): Buffer[] {
   const parts: Buffer[] = [];
   const CHUNK = 65515;
@@ -845,6 +906,9 @@ function sidebandPack(pack: Buffer): Buffer[] {
 // ------------------------------------------------------------------ upload-pack
 
 function lsRefs(store: Store, repo: Repo, args: string[]): HandlerResult {
+  const cacheKey = `ls-refs\n${refsFingerprint(repo)}\n${args.join('\n')}`;
+  const cached = refAnswers.get(cacheKey);
+  if (cached !== undefined) return cached;
   const prefixes: string[] = [];
   let peel = false;
   let symrefs = false;
@@ -876,10 +940,18 @@ function lsRefs(store: Store, repo: Repo, args: string[]): HandlerResult {
     lines.push(pktLine(`${line}\n`));
   }
   lines.push(PKT_FLUSH);
-  return { status: 200, contentType: 'application/x-git-upload-pack-result', body: Buffer.concat(lines) };
+  return rememberAnswer(refAnswers, cacheKey, { status: 200, contentType: 'application/x-git-upload-pack-result', body: Buffer.concat(lines) });
 }
 
 function fetchResult(store: Store, request: FetchRequest, protocol2: boolean): HandlerResult {
+  const key = fetchKey(request, protocol2);
+  const hit = fetchAnswers.get(key);
+  if (hit !== undefined) return hit;
+  const result = fetchResultPlanned(store, request, protocol2);
+  return requestSettled(store, request) ? rememberAnswer(fetchAnswers, key, result) : result;
+}
+
+function fetchResultPlanned(store: Store, request: FetchRequest, protocol2: boolean): HandlerResult {
   const plan = planFetch(store, request);
   const pack = writePack(store, plan.objects);
   const parts: Buffer[] = [];
