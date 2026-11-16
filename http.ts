@@ -40,6 +40,19 @@ export function sendError(store: Store, res: ServerResponse, status: number, mes
 
 /** Read a whole request body (capped, so a hostile body cannot exhaust the 1 GiB sandbox). */
 export function readBody(req: IncomingMessage, cap = 128 * 1024 * 1024): Promise<Buffer> {
+  // The forge's own transport framed and buffered the whole body before the
+  // handler ran; when the request offers it whole, take it directly instead of
+  // replaying it through data/end events. The cap is the transport's own cap at
+  // every call site, so the oversize answer is the same dropped connection.
+  const offered = (req as unknown as { bufferedBody?: () => Buffer }).bufferedBody;
+  if (typeof offered === 'function') {
+    const body = offered.call(req);
+    if (body.length > cap) {
+      req.destroy();
+      return Promise.reject(new Error('request body too large'));
+    }
+    return Promise.resolve(body);
+  }
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let total = 0;
@@ -52,7 +65,7 @@ export function readBody(req: IncomingMessage, cap = 128 * 1024 * 1024): Promise
       }
       chunks.push(chunk);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('end', () => resolve(chunks.length === 1 ? (chunks[0] as Buffer) : Buffer.concat(chunks)));
     req.on('error', reject);
   });
 }

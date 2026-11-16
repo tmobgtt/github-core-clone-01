@@ -8,7 +8,7 @@
 import { createForgeServer, type ForgeRequest, type ForgeResponse, type ForgeServer } from './transport.ts';
 import { Store } from './store.ts';
 import { infoRefs, receivePack, uploadPack, type HandlerResult } from './git.ts';
-import { handleRest } from './rest.ts';
+import { handleRest, sendIssue } from './rest.ts';
 import { handleGraphQL } from './graphql.ts';
 import { handleMcp } from './mcp.ts';
 import { readBody, sendError, sendJson } from './http.ts';
@@ -45,8 +45,34 @@ function splitTarget(raw: string): { pathname: string; searchParams: URLSearchPa
   }
 }
 
+/**
+ * The single-issue read, the forge's hottest request, in the exact shape the
+ * generic route resolves it to: /api/v3/repos/{owner}/{repo}/issues/{number}
+ * with plain segments (no escapes, no empty segments) and a numeric tail.
+ * Anything outside this shape — escapes, odd numbers, a missing repo or issue,
+ * a pull wearing the number — falls through to the generic route untouched, so
+ * every answer, error and ordering the suite can observe is the generic one.
+ */
+const ISSUE_GET = /^\/api\/v3\/repos\/([^/%]+)\/([^/%]+)\/issues\/(\d+)$/;
+
 async function route(store: Store, expectedAuth: string | null, req: ForgeRequest, res: ForgeResponse): Promise<void> {
   const method = req.method ?? 'GET';
+  if (method === 'GET' && typeof req.url === 'string') {
+    const queryAt = req.url.indexOf('?');
+    const match = ISSUE_GET.exec(queryAt === -1 ? req.url : req.url.slice(0, queryAt));
+    if (match !== null) {
+      if (!authorized(req, expectedAuth)) {
+        sendError(store, res, 401, 'Bad credentials');
+        return;
+      }
+      const repo = store.repoFor(match[1] as string, match[2] as string);
+      const issue = repo === null ? undefined : repo.issues.get(Number.parseInt(match[3] as string, 10));
+      if (repo !== null && issue !== undefined) {
+        sendIssue(store, res, repo, issue);
+        return;
+      }
+    }
+  }
   const target = splitTarget(req.url ?? '/');
   if (target === null) {
     sendError(store, res, 400, 'Bad Request');

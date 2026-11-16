@@ -94,3 +94,54 @@ Both are reported.
 - `.makefun/owner.json` (wallet 6Nr5EqxmrkVPPTTa5pPoA1vuAAbn9TqdRCXqWWc3rBZW)
   and the MIT LICENSE with its SPDX-License-Identifier line are preserved
   from v1.
+
+## v3 — the per-request tax diet (2026-11-16)
+
+Same rules as v2: no behavior change, the suite is the contract. Baseline and
+result were measured with the kit's own local grade (kit env + this entry +
+kit scorer: checks plus the four timed workloads), as medians over repeated
+alternating v2/v3 runs on one shared, contended host, so the workload p50
+medians below are the honest comparison.
+
+- **Baseline (v2, medians of 9 grades):** push 440 ms, clone 163 ms, read
+  1203 ms, write 158 ms; perf 155 points; perf_p50_us 378087.
+- **Result (v3, medians of 7 grades):** push 435 ms, clone 136 ms, read
+  1205 ms, write 165 ms; perf 163 points; perf_p50_us 333759. Checks 120/120
+  in every v3 grade (feature 600, agent 200 untouched).
+
+What changed — all of it transport and routing, none of it semantics:
+
+- **Head parsing scans bytes, not strings.** parseHead used to convert the
+  whole request head to a latin1 string and slice every line out of it; it
+  now walks the raw buffer by index and converts only each header name and
+  value, once, trimming spaces and tabs at the index level. Duplicate
+  headers still join with ", ", and every error case (bad request line, bad
+  version, bad header, bad content-length, headers too large) is preserved,
+  including the head-with-no-line-break corner, which starts the header scan
+  at index 1 exactly as the string version's missed indexOf did.
+- **The buffered body is served whole.** ForgeRequest gained bufferedBody():
+  the chunks the transport already framed and held, joined once and
+  memoized. readBody takes that buffer directly when the request offers it,
+  so a POST body crosses the handler boundary with no data/end event
+  replay; the event path remains for anything the transport did not frame,
+  and a single held chunk is no longer copied by Buffer.concat on that path
+  either.
+- **The single-issue read has a front lane.** app.ts matches the exact
+  happy-path shape (plain segments, numeric tail) on the query-stripped
+  target, checks authorization first, and serves a held issue through the
+  same sendIssue the generic route uses (now exported from rest.ts). A
+  missing repo, a missing issue, a pull wearing the number, an escaped or
+  odd segment — anything that is not the plain happy path — falls through
+  to the generic route untouched, so every error and fallback answer is
+  still produced by the code that always produced it.
+- **Response heads are concatenated, not collected.** ForgeResponse.end
+  builds its head by string concatenation instead of an array join, and an
+  empty body no longer pays a Buffer.concat in the connection's finisher.
+
+Where the wall is: the timed clients and the round trips dominate on a
+shared host — under CPU profiling the forge idles most of every second — so
+the read and write wall medians barely move locally even though the forge
+spends measurably less CPU per read (about 25 µs of CPU per issue GET
+removed by the front lane alone in a request-count-controlled micro-bench).
+The geomean and perf medians still improved (clone −17%, perf_p50_us
+−12%), because every workload pays the same per-request tax the diet trims.

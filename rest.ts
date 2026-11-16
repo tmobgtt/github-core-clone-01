@@ -137,7 +137,7 @@ function issueStamp(repo: Repo, issue: Issue): string {
 }
 
 /** Answer a single-issue read (or the echo of its edit) with the memoized bytes. */
-function sendIssue(store: Store, res: ServerResponse, repo: Repo, issue: Issue): void {
+export function sendIssue(store: Store, res: ServerResponse, repo: Repo, issue: Issue): void {
   const stamp = issueStamp(repo, issue);
   const held = issueBodies.get(issue);
   if (held !== undefined && held.stamp === stamp) {

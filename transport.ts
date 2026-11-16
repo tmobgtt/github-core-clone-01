@@ -27,6 +27,7 @@ export class ForgeRequest extends EventEmitter {
   readonly headers: Record<string, string>;
   readonly httpVersion: string;
   private chunks: Buffer[];
+  private bodyCache: Buffer | null = null;
   private fed = false;
   private gone: (() => void) | null;
 
@@ -56,6 +57,20 @@ export class ForgeRequest extends EventEmitter {
       for (const chunk of chunks) this.emit('data', chunk);
       this.emit('end');
     });
+  }
+
+  /**
+   * The whole request body as one buffer, for readers that want it synchronously
+   * instead of through the data/end replay. The transport framed and buffered the
+   * body in full before the handler ran, so this only joins what is already held;
+   * the replay path keeps working from the same chunks either way.
+   */
+  bufferedBody(): Buffer {
+    if (this.bodyCache !== null) return this.bodyCache;
+    const chunks = this.chunks;
+    const body = chunks.length === 0 ? Buffer.alloc(0) : chunks.length === 1 ? (chunks[0] as Buffer) : Buffer.concat(chunks);
+    this.bodyCache = body;
+    return body;
   }
 
   /** readBody's escape hatch for an oversize body: drop the whole connection. */
@@ -93,17 +108,17 @@ export class ForgeResponse {
     this.headersSent = true;
     const body = data === undefined ? Buffer.alloc(0) : typeof data === 'string' ? Buffer.from(data, 'utf8') : data;
     const bodiless = this.status === 204 || this.status === 304 || this.method === 'HEAD';
-    const lines = [`HTTP/1.1 ${this.status} ${STATUS_CODES[this.status] ?? ''}\r\n`];
+    let head = `HTTP/1.1 ${this.status} ${STATUS_CODES[this.status] ?? ''}\r\n`;
     let hasLength = false;
     for (const [name, value] of Object.entries(this.headers)) {
       if (name.toLowerCase() === 'content-length') hasLength = true;
-      lines.push(`${name}: ${value}\r\n`);
+      head += `${name}: ${value}\r\n`;
     }
     // Every answer this forge gives is one buffered shot, so a missing length can
     // always be supplied exactly; a bodiless answer needs none.
-    if (!hasLength && !bodiless) lines.push(`content-length: ${body.length}\r\n`);
-    lines.push('\r\n');
-    this.finish(Buffer.from(lines.join(''), 'latin1'), bodiless ? null : body);
+    if (!hasLength && !bodiless) head += `content-length: ${body.length}\r\n`;
+    head += '\r\n';
+    this.finish(Buffer.from(head, 'latin1'), bodiless || body.length === 0 ? null : body);
   }
 }
 
@@ -204,10 +219,12 @@ class Connection {
       if (this.buffer.length > HEADER_CAP) return { error: 'headers too large' } as never;
       return null;
     }
-    // Scan line by line in place: one latin1 pass over the head, no line array.
-    const text = this.buffer.toString('latin1', 0, end);
-    const firstBreak = text.indexOf('\r\n');
-    const requestLine = firstBreak === -1 ? text : text.slice(0, firstBreak);
+    // Scan the head in place on the raw bytes: only the request line and the
+    // header names and values ever become strings, each converted once. (v2
+    // converted the whole head to a string and sliced every line out of it.)
+    const buffer = this.buffer;
+    const firstBreak = buffer.indexOf('\r\n');
+    const requestLine = buffer.toString('latin1', 0, firstBreak === -1 ? end : firstBreak);
     const firstSpace = requestLine.indexOf(' ');
     const lastSpace = requestLine.lastIndexOf(' ');
     if (firstSpace <= 0 || lastSpace <= firstSpace) return { error: 'bad request line' } as never;
@@ -216,17 +233,31 @@ class Connection {
     const version = requestLine.slice(lastSpace + 1);
     if (!version.startsWith('HTTP/1.')) return { error: 'bad version' } as never;
     const headers: Record<string, string> = {};
-    let at = firstBreak + 2;
-    while (at < text.length) {
-      const lineEnd = text.indexOf('\r\n', at);
-      const line = lineEnd === -1 ? text.slice(at) : text.slice(at, lineEnd);
-      const colon = line.indexOf(':');
-      if (colon <= 0) return { error: 'bad header' } as never;
-      const name = line.slice(0, colon).trim().toLowerCase();
-      const value = line.slice(colon + 1).trim();
+    // The head text the original scanned ended at `end`, so a first line break
+    // only counts when it falls strictly inside the head; a head with no break
+    // (a request line alone) starts the header scan at index 1, exactly as the
+    // string version's indexOf miss did.
+    const headBreak = firstBreak < end ? firstBreak : -1;
+    let at = headBreak + 2;
+    while (at < end) {
+      const found = buffer.indexOf('\r\n', at);
+      const lineEnd = found === -1 || found > end ? end : found;
+      const colon = buffer.indexOf(0x3a, at);
+      if (colon === -1 || colon >= lineEnd || colon <= at) return { error: 'bad header' } as never;
+      // Header names and values are space/tab padded at most; trim on indices so
+      // the only strings built are the trimmed name and value themselves.
+      let nameStart = at;
+      let nameEnd = colon;
+      while (nameStart < nameEnd && (buffer[nameStart] === 0x20 || buffer[nameStart] === 0x09)) nameStart += 1;
+      while (nameEnd > nameStart && (buffer[nameEnd - 1] === 0x20 || buffer[nameEnd - 1] === 0x09)) nameEnd -= 1;
+      let valueStart = colon + 1;
+      let valueEnd = lineEnd;
+      while (valueStart < valueEnd && (buffer[valueStart] === 0x20 || buffer[valueStart] === 0x09)) valueStart += 1;
+      while (valueEnd > valueStart && (buffer[valueEnd - 1] === 0x20 || buffer[valueEnd - 1] === 0x09)) valueEnd -= 1;
+      const name = buffer.toString('latin1', nameStart, nameEnd).toLowerCase();
+      const value = buffer.toString('latin1', valueStart, valueEnd);
       const held = headers[name];
       headers[name] = held === undefined ? value : `${held}, ${value}`;
-      if (lineEnd === -1) break;
       at = lineEnd + 2;
     }
     const connection = (headers['connection'] ?? '').toLowerCase();
